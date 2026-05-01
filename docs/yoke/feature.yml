@@ -1,0 +1,356 @@
+version: "1"
+
+template:
+  name: feature
+  description: "The full Groove feature workflow: idea → planned, sliced, built, reviewed, resolved, verified, harvested. One config, no human gates."
+
+# =============================================================================
+# This template encodes the entire Groove feature workflow from groove.md
+# in a single Yoke config. Six stages (alternating once / per-item) cover all
+# 12 phases of the framework's DAG.
+#
+# Human gates (Gate A / Gate B / Gate C) are intentionally elided here.
+# The DAG runs end-to-end autonomously. Restore gates by inserting marker-check
+# phases with `retry_ladder: [awaiting_user]` between stages — see README.
+#
+# Stage map:
+#   plan     [once]     clarify → research → plan-synth → decompose
+#   build    [per-item] (per slice, dep order) red → green → refactor
+#   review   [once]     review-fanout
+#   resolve  [per-item] (per finding: P1 + in-scope P2) resolve-finding
+#   defer    [per-item] (per finding: out-of-scope P2 + all P3) file-issue
+#   close    [once]     verify-vs-plan → harvest
+# =============================================================================
+
+pipeline:
+  stages:
+
+    # -- Stage 1: Plan ---------------------------------------------------------
+    # All "once" plan-time work: clarify the idea, research the codebase + docs +
+    # prior solutions, synthesize the plan with slice list, derive the slice DAG.
+    - id: plan
+      run: once
+      phases:
+        - clarify
+        - research
+        - plan-synth
+        - decompose
+
+    # -- Stage 2: Build --------------------------------------------------------
+    # Yoke iterates slices in dependency order (items_depends_on edge from the
+    # slice DAG decompose just produced). Each slice runs in fresh context.
+    # red/green/refactor TDD cycle per slice.
+    - id: build
+      run: per-item
+      items_from: docs/plan.slices.yml
+      items_list: "$.slices"
+      items_id: "$.id"
+      items_depends_on: "$.semantic_depends_on"
+      phases:
+        - red
+        - green
+        - refactor
+
+    # -- Stage 3: Review -------------------------------------------------------
+    # Specialist fan-out. The review-fanout phase prompts Claude to read the
+    # reviewer index, pick 3-5 matching specialists by predicate, and produce
+    # docs/findings.json with priorities.
+    - id: review
+      run: once
+      phases:
+        - review-fanout
+
+    # -- Stage 4: Resolve ------------------------------------------------------
+    # Auto-resolve everything that is both critical (P1) AND any P2 in scope of
+    # the changed code. Out-of-scope work is deferred (next stage).
+    # P1 is always in-scope by policy: a P1 finding is a merge-blocker even if
+    # it's outside the slice's blast radius. Adjust the filter to taste.
+    - id: resolve
+      run: per-item
+      items_from: docs/findings.json
+      items_list: "$.findings[?(@.priority=='P1' || (@.priority=='P2' && @.in_scope==true))]"
+      items_id: "$.id"
+      phases:
+        - resolve-finding
+
+    # -- Stage 5: Defer --------------------------------------------------------
+    # Out-of-scope P2 + all P3 findings get filed as GitHub issues for later.
+    # The file-issue phase calls a Claude session that writes a clean title and
+    # body, picks labels, dedups against existing issues, and appends the URL
+    # to docs/issues-filed.json. Harvest later reads this file and may promote
+    # recurring deferral categories to anti-patterns.
+    - id: defer
+      run: per-item
+      items_from: docs/findings.json
+      items_list: "$.findings[?(@.priority=='P3' || (@.priority=='P2' && @.in_scope==false))]"
+      items_id: "$.id"
+      phases:
+        - file-issue
+
+    # -- Stage 6: Close --------------------------------------------------------
+    # Fresh-context verifier compares delivered code against the plan, then
+    # harvest writes 0–4 substrate entries based on what the workflow surfaced.
+    # PR is auto-created via the github config below (replaces theory's Gate C).
+    - id: close
+      run: once
+      phases:
+        - verify-vs-plan
+        - harvest
+
+# =============================================================================
+# Phases
+# Each phase = one Claude session in fresh context. `post:` commands are the
+# deterministic gates; failures walk the retry ladder.
+# Replace pnpm + test/lint/typecheck with your project's equivalents.
+# =============================================================================
+
+phases:
+
+  # -- Plan-stage phases ------------------------------------------------------
+
+  clarify:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/clarify.md
+    post:
+      - name: brainstorm-exists
+        run: ["test", "-f", "docs/brainstorm.md"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+
+  research:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/research.md
+    post:
+      - name: research-exists
+        run: ["test", "-f", "docs/research.md"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+
+  plan-synth:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/plan-synth.md
+    post:
+      - name: plan-exists
+        run: ["test", "-f", "docs/plan.md"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+      - name: slices-schema-valid
+        run: ["pnpm", "exec", "validate-slices", "docs/plan.slices.yml"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+
+  decompose:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/decompose.md
+    pre:
+      # [4a] Deterministic file-overlap DAG. Mechanical truth, runs first.
+      - name: derive-file-dag
+        run: ["pnpm", "exec", "derive-file-dag", "docs/plan.slices.yml"]
+    post:
+      # [4b] Agent has now added semantic edges. Validate the result.
+      - name: slice-dag-valid
+        run: ["pnpm", "exec", "validate-slice-dag", "docs/plan.slices.yml"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+
+  # -- Build-stage phases (run per-slice, fresh context per slice) ------------
+
+  red:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/red.md
+    post:
+      # RED = a test exists AND fails. The bash check inverts the test exit code.
+      - name: red-test-fails
+        run: ["bash", "-c", "pnpm test --run; [ $? -ne 0 ]"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+
+  green:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/green.md
+    post:
+      - name: tests-pass
+        run: ["pnpm", "test", "--run"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 3 }
+      - name: lint-clean
+        run: ["pnpm", "lint"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+      - name: typecheck-clean
+        run: ["pnpm", "typecheck"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+
+  refactor:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/refactor.md
+    post:
+      - name: tests-still-pass
+        run: ["pnpm", "test", "--run"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 1 }
+      - name: lint-clean
+        run: ["pnpm", "lint"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 1 }
+      - name: typecheck-clean
+        run: ["pnpm", "typecheck"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 1 }
+
+  # -- Review-stage phase -----------------------------------------------------
+
+  review-fanout:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/review-fanout.md
+    post:
+      - name: findings-exist
+        run: ["test", "-f", "docs/findings.json"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+      - name: findings-schema-valid
+        run: ["pnpm", "exec", "validate-findings", "docs/findings.json"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+
+  # -- Resolve-stage phase (run per-finding) ---------------------------------
+
+  resolve-finding:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/resolve-finding.md
+    post:
+      - name: tests-pass
+        run: ["pnpm", "test", "--run"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 3 }
+      - name: lint-clean
+        run: ["pnpm", "lint"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+      - name: typecheck-clean
+        run: ["pnpm", "typecheck"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+
+  # -- Defer-stage phase (run per-finding) -----------------------------------
+
+  file-issue:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/file-issue.md
+    pre:
+      # Ensure the issues-filed registry exists before append.
+      - name: ensure-issues-file
+        run: ["bash", "-c", "test -f docs/issues-filed.json || echo '[]' > docs/issues-filed.json"]
+    post:
+      - name: issue-url-recorded
+        # Confirm the registry now contains an entry for the current finding id.
+        run: ["bash", "-c", "jq -e --arg id \"$YOKE_ITEM_ID\" 'any(.[]; .finding_id == $id)' docs/issues-filed.json"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+
+  # -- Close-stage phases -----------------------------------------------------
+
+  verify-vs-plan:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/verify-vs-plan.md
+    post:
+      - name: verification-exists
+        run: ["test", "-f", "docs/verification.md"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+
+  harvest:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/harvest.md
+    post:
+      - name: harvest-summary-exists
+        run: ["test", "-f", "docs/harvest.md"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+      - name: substrate-indexes-valid
+        run: ["pnpm", "exec", "validate-substrate", ".substrate/"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 1 }
+
+# =============================================================================
+# Worktree + GitHub + runtime
+# =============================================================================
+
+worktrees:
+  base_dir: .worktrees
+  bootstrap:
+    commands:
+      - "pnpm install --frozen-lockfile"
+      # Fail fast if gh is not authenticated — the defer stage needs it.
+      - "gh auth status"
+      # jq is used by file-issue's post-check; verify it's available.
+      - "jq --version"
+
+# Auto-PR replaces the theory's Gate C in this no-gate config. PR review still
+# happens on GitHub via your normal review process; the harness has no role
+# beyond opening the PR.
+github:
+  enabled: true
+  auto_pr: true
+  pr_target_branch: main
+
+runtime:
+  keep_awake: true
+
+rate_limit:
+  handling: passive
