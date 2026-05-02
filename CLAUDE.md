@@ -18,6 +18,9 @@ Uses the five canonical default label strings. See `docs/agents/triage-labels.md
 
 Single-context repo — one `CONTEXT.md` + `docs/adr/` at the root. See `docs/agents/domain.md`.
 
+### Implementation entrypoint
+
+Issues whose deliverable is authored content (SKILL.md prompts, templates, seed substrate, configs, docs) — not executable code logic — should be implemented via `/implement-issue <N>`, not `/tdd`. The skill lives at `.claude/skills/implement-issue/`. Issue bodies that should not use `/tdd` carry an explicit "do not use /tdd" callout.
 ## GitHub conventions
 
 All issues and PRs created by agents must be assigned to `jdforsythe`.
