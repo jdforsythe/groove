@@ -1,0 +1,167 @@
+version: "1"
+
+template:
+  name: consolidate
+  description: "The Groove consolidate workflow: substrate hygiene. Promotes anti-patterns, merges duplicate ADRs, prunes stale entries, retags moved scopes. Touches .substrate/ only — no source code. No PR auto-opened."
+
+# =============================================================================
+# This template encodes the Groove consolidate workflow from groove.md.
+# Run weekly or when substrate signal degrades (indexes becoming noisy,
+# retrieval precision dropping, duplicate ADR pairs accumulating).
+#
+# Consolidate touches .substrate/ only. It NEVER modifies source code and
+# does not open a PR. All writes are append-only via substrate-write.
+#
+# Stage map:
+#   prepare  [once]     substrate-read (full eager load)
+#   promote  [once]     promote-anti-patterns
+#   merge    [once]     merge-adrs
+#   prune    [once]     prune-stale
+#   retag    [once]     retag-scopes
+# =============================================================================
+
+pipeline:
+  stages:
+
+    # -- Stage 1: Prepare ------------------------------------------------------
+    # Eagerly load all substrate indexes and entry bodies into the working
+    # context. This is the only I/O-heavy stage; subsequent stages operate
+    # on the loaded snapshot.
+    - id: prepare
+      run: once
+      phases:
+        - substrate-read
+
+    # -- Stage 2: Promote ------------------------------------------------------
+    # Pass A: promote recurring anti-patterns to reviewer entries.
+    # Anti-patterns matched >= N times in the observation window get a
+    # corresponding reviewer entry with a matching predicate.
+    - id: promote
+      run: once
+      phases:
+        - promote-anti-patterns
+
+    # -- Stage 3: Merge --------------------------------------------------------
+    # Pass B: merge overlapping ADR pairs into a single consolidated ADR.
+    # Superseded originals remain on disk; the merged entry carries
+    # supersedes: [old-id-1, old-id-2].
+    - id: merge
+      run: once
+      phases:
+        - merge-adrs
+
+    # -- Stage 4: Prune --------------------------------------------------------
+    # Pass C: write stale markers for solutions and ADRs with zero retrievals
+    # in the observation window. Nothing is deleted.
+    - id: prune
+      run: once
+      phases:
+        - prune-stale
+
+    # -- Stage 5: Retag --------------------------------------------------------
+    # Pass D: detect file/directory moves from git history and write versioned
+    # entries with updated scope globs for any anti-patterns or solutions whose
+    # scope paths no longer match the codebase layout.
+    - id: retag
+      run: once
+      phases:
+        - retag-scopes
+
+# =============================================================================
+# Phases
+# =============================================================================
+
+phases:
+
+  # -- Prepare-stage phase ----------------------------------------------------
+
+  substrate-read:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/consolidate-substrate-read.md
+    post:
+      - name: substrate-indexes-loaded
+        # All five indexes must exist before proceeding.
+        run: ["bash", "-c", "test -f .substrate/vocabulary/INDEX.md && test -f .substrate/adr/INDEX.md && test -f .substrate/anti-patterns/INDEX.md && test -f .substrate/solutions/INDEX.md && test -f .substrate/reviewers/INDEX.md"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 1 }
+
+  # -- Promote-stage phase ----------------------------------------------------
+
+  promote-anti-patterns:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/promote-anti-patterns.md
+    post:
+      - name: reviewer-index-valid
+        run: ["pnpm", "exec", "validate-substrate", ".substrate/reviewers/"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 1 }
+
+  # -- Merge-stage phase ------------------------------------------------------
+
+  merge-adrs:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/merge-adrs.md
+    post:
+      - name: adr-index-valid
+        run: ["pnpm", "exec", "validate-substrate", ".substrate/adr/"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 1 }
+
+  # -- Prune-stage phase ------------------------------------------------------
+
+  prune-stale:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/prune-stale.md
+    post:
+      - name: substrate-indexes-valid
+        run: ["pnpm", "exec", "validate-substrate", ".substrate/"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 1 }
+
+  # -- Retag-stage phase ------------------------------------------------------
+
+  retag-scopes:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/retag-scopes.md
+    post:
+      - name: substrate-indexes-valid
+        run: ["pnpm", "exec", "validate-substrate", ".substrate/"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 1 }
+
+# =============================================================================
+# Worktree + GitHub + runtime
+# =============================================================================
+
+worktrees:
+  base_dir: .worktrees
+  bootstrap:
+    commands:
+      - "pnpm install --frozen-lockfile"
+
+# Consolidate produces no shipped code and opens no PR. All output stays
+# in .substrate/ and is committed directly to the repo.
+github:
+  enabled: false
+  auto_pr: false
+
+runtime:
+  keep_awake: true
+
+rate_limit:
+  handling: passive

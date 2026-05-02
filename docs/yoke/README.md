@@ -112,4 +112,13 @@ yoke start
 
 ## Scope
 
-This template covers the **feature** workflow only. The other three workflow types in the theory (`spike`, `optimize`, `consolidate`) belong in separate template files. They share the same substrate.
+All four workflow types from the theory are covered:
+
+| Template | Description |
+|---|---|
+| `feature.yml` + `prompts.md` | Full feature workflow: idea → planned, sliced, built, reviewed, resolved, verified, harvested. |
+| `spike.yml` + `spike-prompts.md` | Exploratory workflow: clarify → research → exploratory build → substrate-write. Output is substrate knowledge, not shipped code. |
+| `optimize.yml` + `optimize-prompts.md` | Cadence-driven performance and debt reduction. Same phase shape as feature; different `items_from`. Must run in its own worktree. |
+| `consolidate.yml` + `consolidate-prompts.md` | Substrate hygiene: promote anti-patterns, merge duplicate ADRs, prune stale entries, retag moved scopes. No source code changes, no PR. |
+
+All four templates share the same substrate at `.substrate/`.

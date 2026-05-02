@@ -1,0 +1,129 @@
+version: "1"
+
+template:
+  name: spike
+  description: "The Groove spike workflow: clarify → research → exploratory build → substrate-write. Output is substrate knowledge, not shipped code."
+
+# =============================================================================
+# This template encodes the Groove spike workflow from groove.md.
+# A spike is used when the plan cannot be written without exploratory code.
+# Output is substrate updates — findings, vocabulary, ADR candidates — not a
+# PR. github.auto_pr is intentionally false.
+#
+# Stage map:
+#   plan     [once]     clarify → research
+#   explore  [once]     spike-build
+#   close    [once]     substrate-write
+# =============================================================================
+
+pipeline:
+  stages:
+
+    # -- Stage 1: Plan ---------------------------------------------------------
+    # Clarify the spike goal and research the area under exploration.
+    # Substrate indexes are read eagerly here to anchor the spike in prior
+    # decisions and vocabulary before any code is written.
+    - id: plan
+      run: once
+      phases:
+        - clarify
+        - research
+
+    # -- Stage 2: Explore ------------------------------------------------------
+    # The exploratory build. No TDD cycle — the goal is learning, not shipping.
+    # The build may produce throw-away code, a proof-of-concept, or a working
+    # prototype. What it MUST produce is a documented findings doc.
+    # No PR is auto-opened; the deliverable is substrate, not source.
+    - id: explore
+      run: once
+      phases:
+        - spike-build
+
+    # -- Stage 3: Close --------------------------------------------------------
+    # Harvest the spike's findings into substrate. May produce vocabulary,
+    # ADR candidates, anti-patterns, or solution sketches. No PR.
+    - id: close
+      run: once
+      phases:
+        - substrate-write
+
+# =============================================================================
+# Phases
+# =============================================================================
+
+phases:
+
+  # -- Plan-stage phases ------------------------------------------------------
+
+  clarify:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/clarify.md
+    post:
+      - name: brainstorm-exists
+        run: ["test", "-f", "docs/brainstorm.md"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+
+  research:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/research.md
+    post:
+      - name: research-exists
+        run: ["test", "-f", "docs/research.md"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+
+  # -- Explore-stage phase ----------------------------------------------------
+
+  spike-build:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/spike-build.md
+    post:
+      - name: spike-findings-exist
+        run: ["test", "-f", "docs/spike-findings.md"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+
+  # -- Close-stage phase ------------------------------------------------------
+
+  substrate-write:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/spike-substrate-write.md
+    post:
+      - name: substrate-indexes-valid
+        run: ["pnpm", "exec", "validate-substrate", ".substrate/"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 1 }
+
+# =============================================================================
+# Worktree + GitHub + runtime
+# =============================================================================
+
+worktrees:
+  base_dir: .worktrees
+  bootstrap:
+    commands:
+      - "pnpm install --frozen-lockfile"
+
+# Spike output is substrate knowledge, not shipped code. No PR is opened.
+github:
+  enabled: false
+  auto_pr: false
+
+runtime:
+  keep_awake: true
+
+rate_limit:
+  handling: passive

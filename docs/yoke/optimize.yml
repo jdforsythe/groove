@@ -1,0 +1,325 @@
+version: "1"
+
+template:
+  name: optimize
+  description: "The Groove optimize workflow: cadence-driven performance and debt reduction. Same phase shape as feature; different items_from. Must run in its own worktree — never piggyback on a feature workflow."
+
+# =============================================================================
+# This template encodes the Groove optimize workflow from groove.md.
+# Triggered weekly, after big features, or on performance regressions.
+# Input comes from profilers, production logs, error trackers, or git heuristics
+# — not from a feature brainstorm. items_from references docs/optimize-targets.yml
+# which is populated by the clarify/research phases before the build stage runs.
+#
+# IMPORTANT: Optimize touches code outside any single feature's blast radius.
+# It MUST NOT piggyback on a feature workflow. Always run in a dedicated
+# worktree with its own plan and slice list.
+#
+# Stage map:
+#   plan     [once]     clarify → research → plan-synth → decompose
+#   build    [per-item] (per target, dep order) slice-impl → slice-refactor
+#   review   [once]     review-fanout
+#   resolve  [per-item] (per finding: P1 + in-scope P2) resolve-finding
+#   defer    [per-item] (per finding: out-of-scope P2 + all P3) file-issue
+#   close    [once]     verify-vs-plan → harvest
+# =============================================================================
+
+pipeline:
+  stages:
+
+    # -- Stage 1: Plan ---------------------------------------------------------
+    # All "once" plan-time work: clarify the optimization goal, research
+    # profiler/log data and codebase patterns, synthesize the plan with a
+    # target list, derive the target DAG.
+    - id: plan
+      run: once
+      phases:
+        - clarify
+        - research
+        - plan-synth
+        - decompose
+
+    # -- Stage 2: Build --------------------------------------------------------
+    # Yoke iterates optimization targets in dependency order.
+    # Each target runs in fresh context. No red/green/refactor cycle —
+    # optimize ships improvements, not new features. Uses slice-impl +
+    # slice-refactor directly (no tracer-test).
+    # items_from references docs/optimize-targets.yml, which the plan stage
+    # produces (analogous to docs/plan.slices.yml in the feature workflow).
+    - id: build
+      run: per-item
+      items_from: docs/optimize-targets.yml
+      items_list: "$.targets"
+      items_id: "$.id"
+      items_depends_on: "$.semantic_depends_on"
+      phases:
+        - slice-impl
+        - slice-refactor
+
+    # -- Stage 3: Review -------------------------------------------------------
+    # Specialist fan-out. Same as feature workflow.
+    - id: review
+      run: once
+      phases:
+        - review-fanout
+
+    # -- Stage 4: Resolve ------------------------------------------------------
+    # Auto-resolve P1 and in-scope P2 findings.
+    - id: resolve
+      run: per-item
+      items_from: docs/findings.json
+      items_list: "$.findings[?(@.priority=='P1' || (@.priority=='P2' && @.in_scope==true))]"
+      items_id: "$.id"
+      phases:
+        - resolve-finding
+
+    # -- Stage 5: Defer --------------------------------------------------------
+    # Out-of-scope P2 + all P3 findings get filed as GitHub issues.
+    - id: defer
+      run: per-item
+      items_from: docs/findings.json
+      items_list: "$.findings[?(@.priority=='P3' || (@.priority=='P2' && @.in_scope==false))]"
+      items_id: "$.id"
+      phases:
+        - file-issue
+
+    # -- Stage 6: Close --------------------------------------------------------
+    # Verify delivered improvements against the plan, then harvest.
+    - id: close
+      run: once
+      phases:
+        - verify-vs-plan
+        - harvest
+
+# =============================================================================
+# Phases
+# =============================================================================
+
+phases:
+
+  # -- Plan-stage phases ------------------------------------------------------
+
+  clarify:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/clarify.md
+    post:
+      - name: brainstorm-exists
+        run: ["test", "-f", "docs/brainstorm.md"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+
+  research:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/research.md
+    post:
+      - name: research-exists
+        run: ["test", "-f", "docs/research.md"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+
+  plan-synth:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/plan-synth.md
+    post:
+      - name: plan-exists
+        run: ["test", "-f", "docs/plan.md"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+      - name: targets-schema-valid
+        run: ["pnpm", "exec", "validate-slices", "docs/optimize-targets.yml"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+
+  decompose:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/decompose.md
+    pre:
+      - name: derive-file-dag
+        run: ["pnpm", "exec", "derive-file-dag", "docs/optimize-targets.yml"]
+    post:
+      - name: target-dag-valid
+        run: ["pnpm", "exec", "validate-slice-dag", "docs/optimize-targets.yml"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+
+  # -- Build-stage phases (run per-target, fresh context per target) ----------
+
+  slice-impl:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/slice-impl.md
+    post:
+      - name: tests-pass
+        run: ["pnpm", "test", "--run"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 3 }
+      - name: lint-clean
+        run: ["pnpm", "lint"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+      - name: typecheck-clean
+        run: ["pnpm", "typecheck"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+
+  slice-refactor:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/slice-refactor.md
+    post:
+      - name: tests-still-pass
+        run: ["pnpm", "test", "--run"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 1 }
+      - name: lint-clean
+        run: ["pnpm", "lint"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 1 }
+      - name: typecheck-clean
+        run: ["pnpm", "typecheck"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 1 }
+
+  # -- Review-stage phase -----------------------------------------------------
+
+  review-fanout:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/review-fanout.md
+    post:
+      - name: findings-exist
+        run: ["test", "-f", "docs/findings.json"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+      - name: findings-schema-valid
+        run: ["pnpm", "exec", "validate-findings", "docs/findings.json"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+
+  # -- Resolve-stage phase (run per-finding) ---------------------------------
+
+  resolve-finding:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/resolve-finding.md
+    post:
+      - name: tests-pass
+        run: ["pnpm", "test", "--run"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 3 }
+      - name: lint-clean
+        run: ["pnpm", "lint"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+      - name: typecheck-clean
+        run: ["pnpm", "typecheck"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+
+  # -- Defer-stage phase (run per-finding) -----------------------------------
+
+  file-issue:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/file-issue.md
+    pre:
+      - name: ensure-issues-file
+        run: ["bash", "-c", "test -f docs/issues-filed.json || echo '[]' > docs/issues-filed.json"]
+    post:
+      - name: issue-url-recorded
+        run: ["bash", "-c", "jq -e --arg id \"$YOKE_ITEM_ID\" 'any(.[]; .finding_id == $id)' docs/issues-filed.json"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+
+  # -- Close-stage phases -----------------------------------------------------
+
+  verify-vs-plan:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/verify-vs-plan.md
+    post:
+      - name: verification-exists
+        run: ["test", "-f", "docs/verification.md"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+
+  harvest:
+    command: claude
+    args: ["--output-format", "stream-json", "--verbose"]
+    prompt_template: .yoke/prompts/harvest.md
+    post:
+      - name: harvest-summary-exists
+        run: ["test", "-f", "docs/harvest.md"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 2 }
+      - name: substrate-indexes-valid
+        run: ["pnpm", "exec", "validate-substrate", ".substrate/"]
+        actions:
+          "0": continue
+          "*":
+            retry: { mode: fresh_with_failure_summary, max: 1 }
+
+# =============================================================================
+# Worktree + GitHub + runtime
+# =============================================================================
+
+worktrees:
+  base_dir: .worktrees
+  bootstrap:
+    commands:
+      - "pnpm install --frozen-lockfile"
+      - "gh auth status"
+      - "jq --version"
+
+github:
+  enabled: true
+  auto_pr: true
+  pr_target_branch: main
+
+runtime:
+  keep_awake: true
+
+rate_limit:
+  handling: passive
