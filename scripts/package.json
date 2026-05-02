@@ -1,0 +1,20 @@
+{
+  "name": "@groove/scripts",
+  "version": "1.0.0",
+  "description": "Groove artifact validator scripts and derive-file-dag CLI",
+  "type": "module",
+  "bin": {
+    "validate-slices": "./validate-slices.js",
+    "validate-slice-dag": "./validate-slice-dag.js",
+    "validate-findings": "./validate-findings.js",
+    "validate-substrate": "./validate-substrate.js",
+    "validate-substrate-coverage": "./validate-substrate-coverage.js",
+    "derive-file-dag": "./derive-file-dag.js"
+  },
+  "dependencies": {
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
+    "js-yaml": "^4.1.0",
+    "micromatch": "^4.0.8"
+  }
+}
