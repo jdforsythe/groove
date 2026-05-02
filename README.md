@@ -148,6 +148,12 @@ Each skill declares its inputs and outputs in its `SKILL.md` frontmatter. They c
 
 The Yoke template at [`docs/yoke/feature.yml`](docs/yoke/feature.yml) shows how phases, parallelism, gates, and worktrees compose the pack. Yoke is one option — any harness with per-phase prompts, `items_from` iteration, `pre:`/`post:` hooks, retry ladders, and worktree isolation can run the same skills.
 
+### Seed substrate
+
+The `.substrate/` directory ships as a single bundle: five `INDEX.md` files (vocabulary, adr, anti-pattern, solution, reviewers) plus three seed reviewer entries and one seed anti-pattern. Copy the whole bundle in one step; there is no per-type installation.
+
+This is intentional. Splitting the seed kit by substrate type (separate seeds for vocabulary, ADRs, anti-patterns, reviewers) would require adopters to pick which slices to install. The cognitive overhead outweighs any benefit — the seed content is small and non-conflicting. Install all of it; delete entries that don't apply to your project; let `harvest` grow the substrate from real signal from there.
+
 ---
 
 ## Step-by-step: running a feature interactively
