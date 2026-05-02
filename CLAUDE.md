@@ -17,3 +17,7 @@ Uses the five canonical default label strings. See `docs/agents/triage-labels.md
 ### Domain docs
 
 Single-context repo — one `CONTEXT.md` + `docs/adr/` at the root. See `docs/agents/domain.md`.
+
+## GitHub conventions
+
+All issues and PRs created by agents must be assigned to `jdforsythe`.
